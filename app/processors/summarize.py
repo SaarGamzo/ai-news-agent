@@ -19,10 +19,11 @@ from app.models import NewsArticle
 
 
 class HebrewSummarizer:
-    def __init__(self, llm_config: dict[str, Any]):
+    def __init__(self, llm_config: dict[str, Any], minimum_score: int = 2):
         # Priority: env vars > config > smart defaults
         self.api_key = llm_config.get("api_key", "") or os.getenv("LLM_API_KEY", "")
         provider_env = os.getenv("LLM_PROVIDER", "")
+        self.minimum_score = minimum_score  # Skip LLM for articles at minimum threshold
 
         # Smart provider selection:
         # 1. If explicit provider in env
@@ -53,6 +54,11 @@ class HebrewSummarizer:
 
     def summarize(self, article: NewsArticle) -> NewsArticle:
         article_context = self._build_article_context(article)
+
+        # Optimization: use heuristics for low-score articles to save tokens
+        if article.score <= self.minimum_score:
+            print(f"💰 Using heuristics for low-score article (score={article.score})")
+            return self._fallback_summary(article, article_context)
 
         # Priority order: Groq/OpenAI > Ollama > Fallback
         if self.provider in ("groq", "openai_compatible"):
@@ -207,11 +213,10 @@ class HebrewSummarizer:
 
     def _build_prompt(self, article: NewsArticle, article_context: str) -> str:
         return (
-            "Write a real summary with value for a technical Hebrew reader.\n"
-            "Goals: what's new, why it matters, who it's relevant to, and what are limitations or risks.\n"
-            "Don't repeat marketing slogans. Write precise points.\n\n"
+            "Write a summary for Hebrew-speaking technical readers.\n"
+            "Focus: what's new, why it matters, relevance, and limitations.\n\n"
             "All output must be in Hebrew.\n"
-            "Return valid JSON with this exact schema:\n"
+            "Return valid JSON:\n"
             "{\n"
             '  "title_he": "string",\n'
             '  "source_he": "string",\n'
@@ -222,9 +227,8 @@ class HebrewSummarizer:
             "}\n\n"
             f"Source: {article.source}\n"
             f"Title: {article.title}\n"
-            f"URL: {article.url}\n"
-            f"Snippet: {article.summary[:1200]}\n\n"
-            f"Article Context:\n{article_context[:4500]}"
+            f"Content: {article.summary[:1200]}\n\n"
+            f"Context:\n{article_context[:2000]}"
         )
 
     def _safe_json(self, raw_text: str) -> dict[str, Any]:

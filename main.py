@@ -151,7 +151,7 @@ if len(important_articles) < max_articles:
 
 important_articles = important_articles[:max_articles]
 
-summarizer = HebrewSummarizer(config.get("llm", {}))
+summarizer = HebrewSummarizer(config.get("llm", {}), minimum_score=minimum_score)
 important_articles = summarizer.summarize_many(important_articles)
 important_articles = deduplicate_terms_across_report(important_articles)
 
