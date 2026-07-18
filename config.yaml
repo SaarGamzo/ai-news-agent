@@ -1,0 +1,68 @@
+sources:
+  - name: OpenAI
+    type: rss
+    url: https://openai.com/news/rss.xml
+
+  - name: Anthropic
+    type: html
+    url: https://www.anthropic.com/news
+
+  - name: Hugging Face Blog
+    type: rss
+    url: https://huggingface.co/blog/feed.xml
+
+  - name: Google DeepMind Blog
+    type: rss
+    url: https://blog.google/technology/ai/rss/
+
+  - name: Meta AI
+    type: rss
+    url: https://about.fb.com/news/tag/ai/feed/
+
+  - name: NVIDIA Developer - Generative AI
+    type: rss
+    url: https://developer.nvidia.com/blog/category/generative-ai/feed/
+
+  - name: AWS Machine Learning Blog
+    type: rss
+    url: https://aws.amazon.com/blogs/machine-learning/feed/
+
+  - name: Microsoft AI Blog
+    type: rss
+    url: https://blogs.microsoft.com/blog/tag/artificial-intelligence/feed/
+
+  - name: Cohere Blog
+    type: html
+    url: https://cohere.com/blog
+
+  - name: VentureBeat AI
+    type: rss
+    url: https://venturebeat.com/category/ai/feed/
+
+filter:
+  minimum_score: 2
+  max_age_days: 3
+
+report:
+  output_dir: reports
+  max_articles: 8
+
+llm:
+  provider: openai_compatible
+  # Recommended: keep key in env var (LLM_API_KEY / GEMINI_API_KEY).
+  api_key: ""
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  model: gemini-2.0-flash
+  timeout_seconds: 30
+
+email:
+  enabled: true
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
+  sender: saar.gamzo@intel.com
+  username: saar.gamzo@intel.com
+  password: ""
+  use_tls: true
+  subject: "AI Daily Report"
+  recipients:
+    - saar.gamzo@intel.com
