@@ -56,7 +56,6 @@ jobs:
           git push
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Send email notification (optional)
         if: success()
