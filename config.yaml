@@ -33,7 +33,7 @@ sources:
 
   - name: Cohere Blog
     type: html
-    url: https://cohere.com/blog
+    url: https://cohere.com/blog/tag/company-news
 
   - name: VentureBeat AI
     type: rss
@@ -45,15 +45,16 @@ filter:
 
 report:
   output_dir: reports
-  max_articles: 8
+  max_articles: 15
 
 llm:
-  provider: openai_compatible
-  # Recommended: keep key in env var (LLM_API_KEY / GEMINI_API_KEY).
+  provider: ollama
+  # GitHub Actions: will use Groq + LLM_PROVIDER env variable
+  # Local terminal: will use Ollama (requires: ollama pull mistral && ollama serve)
   api_key: ""
-  base_url: https://generativelanguage.googleapis.com/v1beta/openai
-  model: gemini-2.0-flash
-  timeout_seconds: 30
+  base_url: http://localhost:11434
+  model: mistral
+  timeout_seconds: 60
 
 email:
   enabled: true

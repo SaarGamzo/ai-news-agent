@@ -1,4 +1,5 @@
 import time
+import os
 from datetime import date
 from pathlib import Path
 
@@ -57,6 +58,14 @@ def save_report(html_report: str, output_dir: str) -> Path:
 def maybe_send_email(config: dict, html_report: str) -> None:
     email_cfg = config.get("email", {})
 
+    # Local runs are primarily for debugging/report review. Send email only in CI
+    # unless explicitly overridden.
+    in_github_actions = bool(os.getenv("GITHUB_ACTIONS"))
+    force_local_email = os.getenv("FORCE_LOCAL_EMAIL", "").lower() in {"1", "true", "yes"}
+    if not in_github_actions and not force_local_email:
+        print("Local run detected: skipping email send (set FORCE_LOCAL_EMAIL=true to override).")
+        return
+
     if not email_cfg.get("enabled", False):
         print("Email delivery disabled by config.")
         return
@@ -89,6 +98,22 @@ def maybe_send_email(config: dict, html_report: str) -> None:
         print(f"Email send failed: {exc}")
 
 
+def deduplicate_terms_across_report(articles: list) -> list:
+    seen_terms: set[str] = set()
+
+    for article in articles:
+        unique_terms = {}
+        for term, explanation in article.term_explanations.items():
+            normalized = term.strip().lower()
+            if normalized in seen_terms:
+                continue
+            unique_terms[term] = explanation
+            seen_terms.add(normalized)
+        article.term_explanations = unique_terms
+
+    return articles
+
+
 start_time = time.time()
 config = load_config()
 
@@ -106,10 +131,29 @@ important_articles = sorted(
     important_articles,
     key=lambda article: (article.score, article.published),
     reverse=True,
-)[:max_articles]
+)
+
+if len(important_articles) < max_articles:
+    relaxed_score = max(minimum_score - 1, 0)
+    relaxed_candidates = sorted(
+        filter_articles(all_articles, minimum_score=relaxed_score),
+        key=lambda article: (article.score, article.published),
+        reverse=True,
+    )
+    existing_urls = {article.url for article in important_articles}
+    for candidate in relaxed_candidates:
+        if candidate.url in existing_urls:
+            continue
+        important_articles.append(candidate)
+        existing_urls.add(candidate.url)
+        if len(important_articles) >= max_articles:
+            break
+
+important_articles = important_articles[:max_articles]
 
 summarizer = HebrewSummarizer(config.get("llm", {}))
 important_articles = summarizer.summarize_many(important_articles)
+important_articles = deduplicate_terms_across_report(important_articles)
 
 for article in important_articles:
     print(article.score, "|", article.source, "-", article.title)

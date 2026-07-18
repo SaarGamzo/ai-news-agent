@@ -9,28 +9,79 @@ from html import unescape
 
 import requests
 
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
 from app.models import NewsArticle
 
 
 class HebrewSummarizer:
     def __init__(self, llm_config: dict[str, Any]):
-        self.provider = llm_config.get("provider", "openai_compatible")
+        # Priority: env vars > config > smart defaults
         self.api_key = llm_config.get("api_key", "") or os.getenv("LLM_API_KEY", "")
-        self.base_url = llm_config.get("base_url", "https://api.openai.com/v1")
-        self.model = llm_config.get("model", "gpt-4.1-mini")
-        self.timeout = int(llm_config.get("timeout_seconds", 30))
+        provider_env = os.getenv("LLM_PROVIDER", "")
+
+        # Smart provider selection:
+        # 1. If explicit provider in env
+        # 2. If GitHub Actions + API_KEY exists, use Groq
+        # 3. Otherwise try Ollama locally (unlimited, no rate limits)
+        if provider_env:
+            self.provider = provider_env
+        elif os.getenv("GITHUB_ACTIONS") == "true" and self.api_key:
+            self.provider = "groq"  # Use Groq only on GitHub Actions
+        else:
+            self.provider = llm_config.get("provider", "ollama")  # Default to Ollama
+
+        # Configure provider-specific settings
+        if self.provider == "groq":
+            self.base_url = "https://api.groq.com/openai/v1"
+            self.model = "llama-3.1-8b-instant"
+        elif self.provider == "openai_compatible":
+            self.base_url = "https://api.openai.com/v1"
+            self.model = "gpt-4-turbo"
+        else:  # ollama
+            self.base_url = "http://localhost:11434"
+            self.model = "mistral"
+
+        # Allow env overrides
+        self.base_url = os.getenv("LLM_BASE_URL", self.base_url)
+        self.model = os.getenv("LLM_MODEL", self.model)
+        self.timeout = int(llm_config.get("timeout_seconds", 60))
 
     def summarize(self, article: NewsArticle) -> NewsArticle:
         article_context = self._build_article_context(article)
 
+        # Priority order: Groq/OpenAI > Ollama > Fallback
+        if self.provider in ("groq", "openai_compatible"):
+            return self._summarize_with_openai_compatible(article, article_context)
+
+        if self.provider == "ollama":
+            return self._summarize_with_ollama(article, article_context)
+
+        # Fallback if nothing works
+        return self._fallback_summary(article, article_context)
+
+    def summarize_many(self, articles: list[NewsArticle]) -> list[NewsArticle]:
+        return [self.summarize(article) for article in articles]
+
+    def _summarize_with_openai_compatible(
+        self, article: NewsArticle, article_context: str
+    ) -> NewsArticle:
+        """Use OpenAI-compatible API: Groq, OpenAI, etc."""
         if not self.api_key:
+            print("⚠️  No LLM_API_KEY found. Set it: export LLM_API_KEY='your-key'")
             return self._fallback_summary(article, article_context)
 
         try:
+            provider_name = "Groq" if self.provider == "groq" else "OpenAI"
+            print(f"📡 Using {provider_name} for summarization...")
+
             payload = {
                 "model": self.model,
                 "temperature": 0.2,
-                "response_format": {"type": "json_object"},
                 "messages": [
                     {
                         "role": "system",
@@ -47,6 +98,10 @@ class HebrewSummarizer:
                 ],
             }
 
+            # Only add response_format for providers that support it
+            if self.provider != "groq":
+                payload["response_format"] = {"type": "json_object"}
+
             response = requests.post(
                 f"{self.base_url.rstrip('/')}/chat/completions",
                 headers={
@@ -56,6 +111,15 @@ class HebrewSummarizer:
                 json=payload,
                 timeout=self.timeout,
             )
+
+            if not response.ok:
+                error_msg = response.text
+                if self.provider == "groq":
+                    print(f"⚠️  Groq error ({response.status_code}): {error_msg}")
+                    print("💡 Falling back to heuristics...")
+                    return self._fallback_summary(article, article_context)
+                raise Exception(f"API error: {error_msg}")
+
             response.raise_for_status()
 
             body = response.json()
@@ -79,22 +143,74 @@ class HebrewSummarizer:
                 return self._fallback_summary(article, article_context)
 
             if not article.term_explanations:
-                article.term_explanations = self._extract_context_terms(article, article_context)
+                article.term_explanations = self._extract_context_terms(
+                    article, article_context
+                )
 
             return article
 
-        except Exception:
+        except Exception as e:
+            print(f"⚠️  LLM API error: {e}")
             return self._fallback_summary(article, article_context)
 
-    def summarize_many(self, articles: list[NewsArticle]) -> list[NewsArticle]:
-        return [self.summarize(article) for article in articles]
+    def _summarize_with_ollama(
+        self, article: NewsArticle, article_context: str
+    ) -> NewsArticle:
+        """Use local Ollama model for summarization."""
+        if not OLLAMA_AVAILABLE:
+            print("⚠️  Ollama library not installed. Run: pip install ollama")
+            return self._fallback_summary(article, article_context)
+
+        try:
+            print("📡 Using Ollama (local) for summarization...")
+            prompt = self._build_prompt(article, article_context)
+            response = ollama.generate(
+                model=self.model,
+                prompt=prompt,
+                stream=False,
+                options={
+                    "temperature": 0.2,
+                    "num_ctx": 4096,
+                },
+            )
+
+            content = response.get("response", "")
+            parsed = self._safe_json(content)
+
+            article.hebrew_summary = parsed.get("summary_he", "")
+            article.category = parsed.get("category", article.category)
+            article.hebrew_title = parsed.get("title_he", "")
+            article.hebrew_source = parsed.get("source_he", "")
+            article.actionable_takeaway_he = parsed.get("actionable_takeaway_he", "")
+
+            explanations = parsed.get("terms", [])
+            article.term_explanations = {
+                item.get("term", ""): item.get("explanation_he", "")
+                for item in explanations
+                if item.get("term") and item.get("explanation_he")
+            }
+
+            if not article.hebrew_summary:
+                return self._fallback_summary(article, article_context)
+
+            if not article.term_explanations:
+                article.term_explanations = self._extract_context_terms(
+                    article, article_context
+                )
+
+            return article
+
+        except Exception as e:
+            print(f"⚠️  Ollama error: {e}")
+            print("💡 Make sure Ollama is running: `ollama serve` in another terminal")
+            return self._fallback_summary(article, article_context)
 
     def _build_prompt(self, article: NewsArticle, article_context: str) -> str:
         return (
-            "כתוב סיכום אמיתי עם ערך לקורא טכני בעברית.\n"
-            "מטרות: מה חדש, למה זה חשוב, למי זה רלוונטי, ומה המגבלות או הסיכון.\n"
-            "אל תחזור על סיסמאות שיווקיות. כתוב נקודות מדויקות.\n\n"
-            "כל הפלט חייב להיות בעברית.\n"
+            "Write a real summary with value for a technical Hebrew reader.\n"
+            "Goals: what's new, why it matters, who it's relevant to, and what are limitations or risks.\n"
+            "Don't repeat marketing slogans. Write precise points.\n\n"
+            "All output must be in Hebrew.\n"
             "Return valid JSON with this exact schema:\n"
             "{\n"
             '  "title_he": "string",\n'
@@ -154,7 +270,9 @@ class HebrewSummarizer:
         cleaned = BeautifulSoup(unescape(text), "html.parser").get_text(" ", strip=True)
         return " ".join(cleaned.split())
 
-    def _fallback_summary(self, article: NewsArticle, article_context: str) -> NewsArticle:
+    def _fallback_summary(
+        self, article: NewsArticle, article_context: str
+    ) -> NewsArticle:
         article.hebrew_title = self._heuristic_title(article)
         article.hebrew_source = ""
         article.category = self._heuristic_category(article, article_context)
@@ -169,12 +287,17 @@ class HebrewSummarizer:
             slug_title = self._title_from_url(article.url)
             if slug_title:
                 return slug_title
-        return cleaned or f"עדכון: {article.source}"
+        return cleaned or f"Update: {article.source}"
 
     def _normalize_title(self, title: str) -> str:
         text = (title or "").strip()
         text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"\s*[\-|:]\s*(OpenAI|Anthropic|Cohere|VentureBeat|NVIDIA|AWS|Microsoft).*$", "", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"\s*[\-|:]\s*(OpenAI|Anthropic|Cohere|VentureBeat|NVIDIA|AWS|Microsoft).*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
         return text.strip(" -|")
 
     def _looks_generic_title(self, title: str, source: str) -> bool:
@@ -201,13 +324,13 @@ class HebrewSummarizer:
     def _title_from_url(self, url: str) -> str:
         path = urlparse(url).path.strip("/")
         if not path:
-            return "עדכון AI יומי"
+            return "AI Daily Update"
         part = path.split("/")[-1]
         part = unquote(part).replace("-", " ").replace("_", " ").strip()
         part = re.sub(r"\s+", " ", part)
         if not part:
-            return "עדכון AI יומי"
-        return f"עדכון: {part[:120]}"
+            return "AI Daily Update"
+        return f"Update: {part[:120]}"
 
     def _heuristic_category(self, article: NewsArticle, article_context: str) -> str:
         text = f"{article.title} {article.summary} {article_context}".lower()
@@ -217,7 +340,13 @@ class HebrewSummarizer:
             "new_tools": ["tool", "sdk", "api", "platform", "plugin"],
             "new_hacks": ["hack", "trick", "optimization", "quantization", "lora"],
             "new_workflows": ["workflow", "agent", "automation", "pipeline", "orchestration"],
-            "companies_ecosystem": ["funding", "company", "startup", "partnership", "acquisition"],
+            "companies_ecosystem": [
+                "funding",
+                "company",
+                "startup",
+                "partnership",
+                "acquisition",
+            ],
         }
 
         for category, words in category_rules.items():
@@ -228,100 +357,112 @@ class HebrewSummarizer:
     def _heuristic_summary(self, article: NewsArticle, article_context: str) -> str:
         category = self._heuristic_category(article, article_context)
         category_messages = {
-            "new_models": "העדכון מתמקד ביכולות מודל חדשות, בביצועים ובשיפור איכות התשובות.",
-            "new_tools": "העדכון מתמקד בכלי פיתוח או תשתית חדשים שמקלים על בנייה ושילוב של פתרונות AI.",
-            "new_hacks": "העדכון מתמקד בשיטות אופטימיזציה ושיפורי יעילות להפעלה מהירה וזולה יותר.",
-            "new_workflows": "העדכון מתמקד בתהליכי עבודה אוטומטיים מבוססי סוכנים ושילוב רכיבי מערכת.",
-            "companies_ecosystem": "העדכון מתמקד בשינויים באקו-סיסטם: חברות, שיתופי פעולה ואימוץ ארגוני.",
-            "general": "העדכון מציג שינוי מעשי בתחום הבינה המלאכותית עם השפעה פוטנציאלית על פיתוח מוצר.",
+            "new_models": "Update focuses on new model capabilities, performance improvements, and output quality.",
+            "new_tools": "Update focuses on new development tools or infrastructure that make it easier to build and integrate AI solutions.",
+            "new_hacks": "Update focuses on optimization techniques and efficiency improvements for faster and cheaper execution.",
+            "new_workflows": "Update focuses on automated workflows using agents and system component integration.",
+            "companies_ecosystem": "Update focuses on ecosystem changes: companies, partnerships, and organizational adoption.",
+            "general": "Update presents practical change in AI domain with potential impact on product development.",
         }
         focus = category_messages.get(category, category_messages["general"])
+
+        key_lines = self._extract_focus_lines(article, article_context)
+        numeric_signals = self._extract_numeric_signals(article, article_context)
+
+        details = " ".join(key_lines) if key_lines else (
+            "Article presents operational details on implementation, performance and impact on development processes."
+        )
+        if numeric_signals:
+            details = f"{details} Key figures: {numeric_signals}."
+
         return (
-            f"{focus} "
-            "ברמה המעשית, מומלץ לבחון התאמה לצוות הפיתוח, השפעה על עלויות תפעול ומהירות הטמעה בפרודקשן."
+            f"{details} {focus} "
+            "In practice, consider alignment with development team, impact on operational costs and production deployment speed."
         )
 
     def _heuristic_takeaway(self, article: NewsArticle, article_context: str) -> str:
         text = f"{article.title} {article.summary} {article_context}".lower()
         if "security" in text or "guardrail" in text:
-            return "מומלץ לבדוק הגדרות הרשאות, הפרדת זהויות סוכנים ולוגים לבקרת סיכוני אבטחה."
+            return "Recommend checking permission settings, agent identity separation and logging for security risk control."
         if "cost" in text or "latency" in text or "inference" in text:
-            return "מומלץ לבצע בדיקת עלות-תועלת על עומסי inference ולמדוד latency לפני מעבר לפרודקשן."
+            return "Recommend cost-benefit analysis on inference loads and latency measurement before production deployment."
         if "workflow" in text or "agent" in text or "automation" in text:
-            return "מומלץ להתחיל בפיילוט קטן עם תהליך אחד מדיד ולבחון ROI לפני הרחבה ארגונית."
-        return "מומלץ לבדוק התאמה ל-Use Case קיים ולבנות פיילוט קצר עם מדדי הצלחה ברורים."
+            return "Recommend starting with a small pilot using one measurable process and ROI assessment before enterprise expansion."
+        return "Recommend checking fit with existing use cases and building short pilot with clear success metrics."
 
-    def _extract_context_terms(self, article: NewsArticle, article_context: str) -> dict[str, str]:
+    def _extract_context_terms(
+        self, article: NewsArticle, article_context: str
+    ) -> dict[str, str]:
         glossary = [
             {
-                "label": "אחזור משולב יצירה (RAG)",
+                "label": "RAG (Retrieval-Augmented Generation)",
                 "triggers": ["rag", "retrieval-augmented", "retrieval augmented"],
-                "explanation": "שיטה שמשלבת שליפת מידע חיצוני בזמן יצירת תשובה כדי לשפר דיוק ועדכניות.",
+                "explanation": "Technique combining external information retrieval during response generation to improve accuracy and timeliness.",
             },
             {
-                "label": "כיוונון עדין (Fine-tuning)",
+                "label": "Fine-tuning",
                 "triggers": ["fine-tuning", "finetuning"],
-                "explanation": "התאמת מודל קיים למשימה ספציפית באמצעות אימון נוסף על דאטה ממוקד.",
+                "explanation": "Adapting existing model to specific task through additional training on focused data.",
             },
             {
-                "label": "אינפרנס (Inference)",
+                "label": "Inference",
                 "triggers": ["inference"],
-                "explanation": "שלב ההרצה של המודל על קלט חדש כדי לקבל תוצאה.",
+                "explanation": "Model execution phase on new input to produce output.",
             },
             {
-                "label": "רב-מודאלי (Multimodal)",
+                "label": "Multimodal",
                 "triggers": ["multimodal"],
-                "explanation": "יכולת לעבד כמה סוגי מידע יחד, למשל טקסט, תמונה ואודיו.",
+                "explanation": "Ability to process multiple data types together: text, image, audio.",
             },
             {
-                "label": "בנצ'מרק (Benchmark)",
+                "label": "Benchmark",
                 "triggers": ["benchmark"],
-                "explanation": "מבחן השוואתי למדידת ביצועים של מודלים או מערכות.",
+                "explanation": "Comparative test for measuring model or system performance.",
             },
             {
-                "label": "שהיה (Latency)",
+                "label": "Latency",
                 "triggers": ["latency"],
-                "explanation": "זמן ההשהיה מרגע בקשה ועד קבלת תשובה.",
+                "explanation": "Time delay from request to response.",
             },
             {
-                "label": "חלון הקשר (Context Window)",
+                "label": "Context Window",
                 "triggers": ["context window"],
-                "explanation": "כמות הטקסט שהמודל יכול להתחשב בה בכל קריאה.",
+                "explanation": "Amount of text the model can consider in each call.",
             },
             {
-                "label": "סוכן חכם (Agent)",
+                "label": "Agent",
                 "triggers": ["agent", "agentic"],
-                "explanation": "מערכת שמבצעת משימות באופן אוטונומי חלקי בעזרת מודל שפה וכלים.",
+                "explanation": "System that performs tasks semi-autonomously using language model and tools.",
             },
             {
-                "label": "הסקה רב-שלבית (Reasoning)",
+                "label": "Reasoning",
                 "triggers": ["reasoning"],
-                "explanation": "יכולת לבצע הסקה רב-שלבית לפתרון בעיות מורכבות.",
+                "explanation": "Ability to perform multi-step reasoning for complex problem solving.",
             },
             {
-                "label": "הזרקת פרומפט (Prompt Injection)",
+                "label": "Prompt Injection",
                 "triggers": ["prompt injection"],
-                "explanation": "ניסיון זדוני לגרום למודל להתעלם מהוראות מערכת או מדיניות.",
+                "explanation": "Malicious attempt to make model ignore system instructions or policy.",
             },
             {
-                "label": "מגיני בטיחות (Guardrails)",
+                "label": "Guardrails",
                 "triggers": ["guardrails"],
-                "explanation": "מנגנוני בטיחות שמגבילים פעולות או פלט בעייתי של המודל.",
+                "explanation": "Safety mechanisms limiting problematic model actions or output.",
             },
             {
-                "label": "זיקוק מודל (Distillation)",
+                "label": "Distillation",
                 "triggers": ["distillation"],
-                "explanation": "העברת ידע ממודל גדול למודל קטן כדי לשפר יעילות.",
+                "explanation": "Transferring knowledge from larger to smaller model to improve efficiency.",
             },
             {
-                "label": "קוונטיזציה (Quantization)",
+                "label": "Quantization",
                 "triggers": ["quantization"],
-                "explanation": "הקטנת דיוק מספרי של משקלי מודל כדי לחסוך זיכרון וחישוב.",
+                "explanation": "Reducing numeric precision of model weights to save memory and computation.",
             },
             {
-                "label": "לורה (LoRA)",
+                "label": "LoRA",
                 "triggers": ["lora"],
-                "explanation": "שיטת כיוונון יעילה שמעדכנת מספר קטן של פרמטרים.",
+                "explanation": "Efficient fine-tuning technique updating small number of parameters.",
             },
         ]
 
@@ -332,4 +473,95 @@ class HebrewSummarizer:
                 matched[item["label"]] = item["explanation"]
             if len(matched) >= 3:
                 break
+
+        if len(matched) < 3:
+            acronyms = self._extract_acronyms(
+                f"{article.title} {article.summary} {article_context}"
+            )
+            for term in acronyms:
+                if term in matched:
+                    continue
+                matched[term] = "Technical term mentioned in article. Refer to official product documentation for context."
+                if len(matched) >= 3:
+                    break
+
         return matched
+
+    def _extract_focus_lines(
+        self, article: NewsArticle, article_context: str
+    ) -> list[str]:
+        raw = self._clean_text(f"{article.summary} {article_context}")
+        if not raw:
+            return []
+
+        # Split by sentence and keep informative lines, skipping obvious boilerplate/navigation.
+        candidates = re.split(r"(?<=[.!?])\s+", raw)
+        blocked_tokens = [
+            "cookie",
+            "privacy",
+            "terms",
+            "subscribe",
+            "menu",
+            "sign in",
+            "all rights reserved",
+        ]
+
+        selected = []
+        for sentence in candidates:
+            s = sentence.strip()
+            if len(s) < 60 or len(s) > 260:
+                continue
+            lower = s.lower()
+            if any(token in lower for token in blocked_tokens):
+                continue
+            selected.append(self._light_english_wrap(s))
+            if len(selected) >= 2:
+                break
+        return selected
+
+    def _extract_numeric_signals(self, article: NewsArticle, article_context: str) -> str:
+        text = f"{article.title} {article.summary} {article_context}"
+        matches = re.findall(
+            r"\b\d+(?:\.\d+)?\s?(?:%|x|X|k|K|m|M|b|B|ms|s|sec|seconds|minutes|hours)?\b",
+            text,
+        )
+        cleaned = []
+        for m in matches:
+            m2 = m.strip()
+            if len(m2) <= 1:
+                continue
+            cleaned.append(m2)
+            if len(cleaned) >= 4:
+                break
+        return ", ".join(cleaned)
+
+    def _extract_acronyms(self, text: str) -> list[str]:
+        candidates = re.findall(r"\b[A-Z]{2,8}\b", text)
+        banned = {"AI", "LLM", "API", "AWS", "NVIDIA", "OPENAI"}
+        results = []
+        for item in candidates:
+            if item in banned:
+                continue
+            if item not in results:
+                results.append(item)
+            if len(results) >= 3:
+                break
+        return results
+
+    def _light_english_wrap(self, text: str) -> str:
+        replacements = {
+            "agent": "agent",
+            "agents": "agents",
+            "workflow": "workflow",
+            "workflows": "workflows",
+            "inference": "inference",
+            "latency": "latency",
+            "benchmark": "benchmark",
+            "multimodal": "multimodal",
+            "security": "security",
+        }
+        out = text
+        for en, wrapped in replacements.items():
+            out = re.sub(rf"\b{re.escape(en)}\b", wrapped, out, flags=re.IGNORECASE)
+        return out
+
