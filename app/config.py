@@ -16,19 +16,15 @@ def load_config(config_path: str = "config.yaml") -> dict:
     config.setdefault("email", {})
 
     llm = config["llm"]
-    llm_api_key = (
-        os.getenv("LLM_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
+    llm_api_key = os.getenv("LLM_API_KEY")
     if llm_api_key:
         llm["api_key"] = llm_api_key
 
-    llm_model = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL")
+    llm_model = os.getenv("LLM_MODEL")
     if llm_model:
         llm["model"] = llm_model
 
-    llm_base_url = os.getenv("LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    llm_base_url = os.getenv("LLM_BASE_URL")
     if llm_base_url:
         llm["base_url"] = llm_base_url
 

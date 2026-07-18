@@ -53,24 +53,27 @@ The report is saved under `reports/`.
 	- `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`
 	- `LLM_MODEL=gemini-2.0-flash`
 
-## Daily 08:00 Automation (GitHub Actions)
+## Daily Automation (GitHub Actions)
 
 Workflow file:
 - `.github/workflows/daily-ai-news-report.yml`
 
 Behavior:
-- Triggered hourly by cron.
-- Runs the report only at `08:00` in `Asia/Jerusalem` time (handles DST correctly).
+- Triggered once daily at `05:00 UTC`.
+- Manual trigger (`workflow_dispatch`) always runs immediately for testing.
 
 Required repository secrets:
-- `LLM_API_KEY` (optional, Gemini API key)
-- `LLM_MODEL` (optional, for example `gemini-2.0-flash`)
-- `LLM_BASE_URL` (optional, `https://generativelanguage.googleapis.com/v1beta/openai`)
+- `EMAIL_ENABLED`
 - `SMTP_HOST`
 - `SMTP_PORT`
 - `SMTP_SENDER`
 - `SMTP_USERNAME`
 - `SMTP_PASSWORD`
 - `EMAIL_RECIPIENTS` (comma-separated, for example `saar.gamzo@intel.com`)
+
+Optional secrets for LLM summarization:
+- `LLM_API_KEY`
+- `LLM_MODEL`
+- `LLM_BASE_URL`
 
 The workflow also commits generated report files under `reports/` back to the repository.

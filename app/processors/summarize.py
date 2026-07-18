@@ -1,6 +1,8 @@
 import json
 import os
+import re
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup
 from html import unescape
@@ -13,12 +15,7 @@ from app.models import NewsArticle
 class HebrewSummarizer:
     def __init__(self, llm_config: dict[str, Any]):
         self.provider = llm_config.get("provider", "openai_compatible")
-        self.api_key = (
-            llm_config.get("api_key", "")
-            or os.getenv("LLM_API_KEY", "")
-            or os.getenv("GEMINI_API_KEY", "")
-            or os.getenv("OPENAI_API_KEY", "")
-        )
+        self.api_key = llm_config.get("api_key", "") or os.getenv("LLM_API_KEY", "")
         self.base_url = llm_config.get("base_url", "https://api.openai.com/v1")
         self.model = llm_config.get("model", "gpt-4.1-mini")
         self.timeout = int(llm_config.get("timeout_seconds", 30))
@@ -167,7 +164,50 @@ class HebrewSummarizer:
         return article
 
     def _heuristic_title(self, article: NewsArticle) -> str:
-        return f"עדכון: {article.source}"
+        cleaned = self._normalize_title(article.title)
+        if self._looks_generic_title(cleaned, article.source):
+            slug_title = self._title_from_url(article.url)
+            if slug_title:
+                return slug_title
+        return cleaned or f"עדכון: {article.source}"
+
+    def _normalize_title(self, title: str) -> str:
+        text = (title or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s*[\-|:]\s*(OpenAI|Anthropic|Cohere|VentureBeat|NVIDIA|AWS|Microsoft).*$", "", text, flags=re.IGNORECASE)
+        return text.strip(" -|")
+
+    def _looks_generic_title(self, title: str, source: str) -> bool:
+        if not title:
+            return True
+        lower_title = title.lower()
+        lower_source = (source or "").lower()
+        generic_tokens = {
+            "news",
+            "blog",
+            "home",
+            "ai blog",
+            "updates",
+            "latest",
+            "cohere",
+            "venturebeat",
+        }
+        if lower_title in generic_tokens:
+            return True
+        if lower_source and lower_title == lower_source:
+            return True
+        return len(lower_title) < 12
+
+    def _title_from_url(self, url: str) -> str:
+        path = urlparse(url).path.strip("/")
+        if not path:
+            return "עדכון AI יומי"
+        part = path.split("/")[-1]
+        part = unquote(part).replace("-", " ").replace("_", " ").strip()
+        part = re.sub(r"\s+", " ", part)
+        if not part:
+            return "עדכון AI יומי"
+        return f"עדכון: {part[:120]}"
 
     def _heuristic_category(self, article: NewsArticle, article_context: str) -> str:
         text = f"{article.title} {article.summary} {article_context}".lower()
