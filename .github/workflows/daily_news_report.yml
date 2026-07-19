@@ -6,8 +6,8 @@ permissions:
 on:
   workflow_dispatch:
   schedule:
-    # Run once daily at 09:00 UTC (11:00 Israel time)
-    - cron: "0 9 * * *"
+    # Run once daily at 06:00 UTC (08:00 Israel time)
+    - cron: "0 6 * * *"
 
 jobs:
   generate-and-send:
