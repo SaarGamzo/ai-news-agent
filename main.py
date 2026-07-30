@@ -6,6 +6,7 @@ from pathlib import Path
 from app.collectors.rss import RSSCollector
 from app.collectors.html import HTMLCollector
 from app.config import load_config
+from app.metrics import RunMetrics
 from app.processors.filter import filter_articles, filter_recent_articles
 from app.processors.deduplicate import deduplicate_articles
 from app.processors.summarize import HebrewSummarizer
@@ -13,7 +14,7 @@ from app.reporting.render import build_html_report, build_compact_email_report
 from app.reporting.email_sender import send_html_email
 
 
-def collect_articles(config: dict) -> list:
+def collect_articles(config: dict, metrics: RunMetrics) -> list:
     all_articles = []
 
     for source in config["sources"]:
@@ -39,9 +40,13 @@ def collect_articles(config: dict) -> list:
             articles = collector.collect()
         except Exception as exc:
             print(f"{source['name']}: failed to collect ({exc})")
+            metrics.collection_errors_per_source[source["name"]] = (
+                metrics.collection_errors_per_source.get(source["name"], 0) + 1
+            )
             continue
 
         print(f"{source['name']}: collected {len(articles)} articles")
+        metrics.articles_per_source[source["name"]] = len(articles)
         all_articles.extend(articles)
 
     return all_articles
@@ -116,15 +121,18 @@ def deduplicate_terms_across_report(articles: list) -> list:
 
 start_time = time.time()
 config = load_config()
+metrics = RunMetrics()
 
-all_articles = collect_articles(config)
+all_articles = collect_articles(config, metrics)
 all_articles = deduplicate_articles(all_articles)
+metrics.articles_after_dedup = len(all_articles)
 
 max_age_days = int(config.get("filter", {}).get("max_age_days", 3))
 all_articles = filter_recent_articles(all_articles, max_age_days=max_age_days)
 
 minimum_score = int(config.get("filter", {}).get("minimum_score", 2))
 important_articles = filter_articles(all_articles, minimum_score=minimum_score)
+metrics.articles_after_filter = len(important_articles)
 
 max_articles = int(config.get("report", {}).get("max_articles", 25))
 important_articles = sorted(
@@ -150,9 +158,17 @@ if len(important_articles) < max_articles:
             break
 
 important_articles = important_articles[:max_articles]
+metrics.articles_in_report = len(important_articles)
 
 summarizer = HebrewSummarizer(config.get("llm", {}), minimum_score=minimum_score)
 important_articles = summarizer.summarize_many(important_articles)
+
+# Copy token counters from summarizer into metrics
+metrics.llm_prompt_tokens = summarizer.total_prompt_tokens
+metrics.llm_completion_tokens = summarizer.total_completion_tokens
+metrics.llm_calls = summarizer.llm_calls
+metrics.llm_fallbacks = summarizer.llm_fallbacks
+
 important_articles = deduplicate_terms_across_report(important_articles)
 
 for article in important_articles:
@@ -167,9 +183,14 @@ report_path = save_report(
 
 print(f"Report saved: {report_path}")
 maybe_send_email(config, email_report)
+metrics.email_sent = True  # maybe_send_email only raises on fatal errors
 
 end_time = time.time()
+metrics.run_duration_seconds = end_time - start_time
+metrics.run_success = True
 
 print(
     f"\nExecution time: {end_time - start_time:.2f} seconds"
 )
+
+metrics.push()

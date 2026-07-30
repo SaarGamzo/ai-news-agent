@@ -52,6 +52,12 @@ class HebrewSummarizer:
         self.model = os.getenv("LLM_MODEL", self.model)
         self.timeout = int(llm_config.get("timeout_seconds", 60))
 
+        # Token / call counters — read by RunMetrics after summarize_many()
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        self.llm_calls: int = 0
+        self.llm_fallbacks: int = 0
+
     def summarize(self, article: NewsArticle) -> NewsArticle:
         article_context = self._build_article_context(article)
 
@@ -131,6 +137,11 @@ class HebrewSummarizer:
             body = response.json()
             content = body["choices"][0]["message"]["content"]
             parsed = self._safe_json(content)
+
+            usage = body.get("usage", {})
+            self.total_prompt_tokens += usage.get("prompt_tokens", 0)
+            self.total_completion_tokens += usage.get("completion_tokens", 0)
+            self.llm_calls += 1
 
             article.hebrew_summary = parsed.get("summary_he", "")
             article.category = parsed.get("category", article.category)
@@ -277,6 +288,7 @@ class HebrewSummarizer:
     def _fallback_summary(
         self, article: NewsArticle, article_context: str
     ) -> NewsArticle:
+        self.llm_fallbacks += 1
         article.hebrew_title = self._heuristic_title(article)
         article.hebrew_source = ""
         article.category = self._heuristic_category(article, article_context)
